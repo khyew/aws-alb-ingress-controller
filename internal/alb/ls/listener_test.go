@@ -1,6 +1,10 @@
 package ls
 
 import (
+	"fmt"
+	"github.com/aws/aws-sdk-go/service/acm"
+	"github.com/kubernetes-sigs/aws-alb-ingress-controller/internal/aws/albacm"
+	"strings"
 	"testing"
 
 	"github.com/kubernetes-sigs/aws-alb-ingress-controller/internal/ingress/controller/dummy"
@@ -38,6 +42,7 @@ var (
 
 func init() {
 	albelbv2.ELBV2svc = albelbv2.NewDummy()
+	albacm.ACMsvc = albacm.NewDummy()
 	albcache.NewCache(metric.DummyCollector{})
 
 	rOpts1 = &ReconcileOptions{
@@ -308,4 +313,391 @@ func TestModificationNeeds(t *testing.T) {
 		t.Error("Listener reported no modification needed. Certificates were different and" +
 			"should require modification")
 	}
+}
+
+func Test_domainMatchesHost(t *testing.T) {
+	var tests = []struct {
+		domain string
+		host   string
+		want   bool
+	}{
+		{"example.com", "example.com", true},
+		{"example.com", "exampl0.com", false},
+
+		// wildcards
+		{"*.example.com", "foo.example.com", true},
+		{"*.example.com", "example.com", false},
+		{"*.exampl0.com", "foo.example.com", false},
+
+		// invalid hosts, not sure these are possible
+		{"*.*.example.com", "foo.bar.example.com", false},
+		{"foo.*.example.com", "foo.bar.example.com", false},
+	}
+
+	for _, test := range tests {
+		var msg = "should"
+		if !test.want {
+			msg = "should not"
+		}
+
+		t.Run(fmt.Sprintf("%s %s match %s", test.domain, msg, test.host), func(t *testing.T) {
+			have := domainMatchesHost(test.domain, test.host)
+			if test.want != have {
+				t.Fail()
+			}
+		})
+	}
+}
+
+func Test_getCertificates(t *testing.T) {
+	var tests = []struct {
+		name      string
+		arn       *string
+		ingress   *extensions.Ingress
+		result    *acm.ListCertificatesOutput
+		resultErr error
+		expected  int
+	}{
+		{
+			name: "when ACM has exact match as TLS host",
+			ingress: &extensions.Ingress{
+				Spec: extensions.IngressSpec{
+					TLS: []extensions.IngressTLS{
+						{
+							Hosts: []string{"foo.example.com"},
+						},
+					},
+				},
+			},
+			result: &acm.ListCertificatesOutput{
+				CertificateSummaryList: []*acm.CertificateSummary{
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:www"),
+						DomainName:     aws.String("foo.example.com"),
+					},
+				},
+			},
+			expected: 1,
+		}, {
+			name: "when ACM has wildcard match with TLS host",
+			ingress: &extensions.Ingress{
+				Spec: extensions.IngressSpec{
+					TLS: []extensions.IngressTLS{
+						{
+							Hosts: []string{"foo.example.com"},
+						},
+					},
+				},
+			},
+			result: &acm.ListCertificatesOutput{
+				CertificateSummaryList: []*acm.CertificateSummary{
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:www"),
+						DomainName:     aws.String("*.example.com"),
+					},
+				},
+			},
+			expected: 1,
+		}, {
+			name: "when ACM has multiple matches with TLS host",
+			ingress: &extensions.Ingress{
+				Spec: extensions.IngressSpec{
+					TLS: []extensions.IngressTLS{
+						{
+							Hosts: []string{"foo.example.com"},
+						},
+					},
+				},
+			},
+			result: &acm.ListCertificatesOutput{
+				CertificateSummaryList: []*acm.CertificateSummary{
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:www"),
+						DomainName:     aws.String("foo.example.com"),
+					},
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:mmm"),
+						DomainName:     aws.String("*.example.com"),
+					},
+				},
+			},
+			expected: 2,
+		}, {
+			name: "when ACM has exact match as Rules host",
+			ingress: &extensions.Ingress{
+				Spec: extensions.IngressSpec{
+					Rules: []extensions.IngressRule{
+						{
+							Host: "foo.example.com",
+						},
+					},
+				},
+			},
+			result: &acm.ListCertificatesOutput{
+				CertificateSummaryList: []*acm.CertificateSummary{
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:www"),
+						DomainName:     aws.String("foo.example.com"),
+					},
+				},
+			},
+			expected: 1,
+		}, {
+			name: "when ACM has wildcard match with Rules host",
+			ingress: &extensions.Ingress{
+				Spec: extensions.IngressSpec{
+					Rules: []extensions.IngressRule{
+						{
+							Host: "foo.example.com",
+						},
+					},
+				},
+			},
+			result: &acm.ListCertificatesOutput{
+				CertificateSummaryList: []*acm.CertificateSummary{
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:www"),
+						DomainName:     aws.String("*.example.com"),
+					},
+				},
+			},
+			expected: 1,
+		}, {
+			name: "when ACM has multiple matches with Rules host",
+			ingress: &extensions.Ingress{
+				Spec: extensions.IngressSpec{
+					Rules: []extensions.IngressRule{
+						{
+							Host: "foo.example.com",
+						},
+					},
+				},
+			},
+			result: &acm.ListCertificatesOutput{
+				CertificateSummaryList: []*acm.CertificateSummary{
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:www"),
+						DomainName:     aws.String("foo.example.com"),
+					},
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:mmm"),
+						DomainName:     aws.String("*.example.com"),
+					},
+				},
+			},
+			expected: 2,
+		}, {
+			name: "when ACM has multiple matches with Rules and TLS hosts",
+			ingress: &extensions.Ingress{
+				Spec: extensions.IngressSpec{
+					TLS: []extensions.IngressTLS{
+						{
+							Hosts: []string{"foo.example.com"},
+						},
+					},
+					Rules: []extensions.IngressRule{
+						{
+							Host: "foo.example.com",
+						},
+					},
+				},
+			},
+			result: &acm.ListCertificatesOutput{
+				CertificateSummaryList: []*acm.CertificateSummary{
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:www"),
+						DomainName:     aws.String("foo.example.com"),
+					},
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:mmm"),
+						DomainName:     aws.String("*.example.com"),
+					},
+				},
+			},
+			expected: 2,
+		}, {
+			name: "when ACM has multiple matches with multiple wildcard hosts",
+			ingress: &extensions.Ingress{
+				Spec: extensions.IngressSpec{
+					TLS: []extensions.IngressTLS{
+						{
+							Hosts: []string{"foo.bar.example.com", "bar.baz.example.com"},
+						},
+					},
+					Rules: []extensions.IngressRule{
+						{
+							Host: "foo.bar.example.com",
+						},
+						{
+							Host: "bar.baz.example.com",
+						},
+					},
+				},
+			},
+			result: &acm.ListCertificatesOutput{
+				CertificateSummaryList: []*acm.CertificateSummary{
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:www"),
+						DomainName:     aws.String("*.bar.example.com"),
+					},
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:mmm"),
+						DomainName:     aws.String("*.baz.example.com"),
+					},
+				},
+			},
+			expected: 2,
+		}, {
+			name: "when certificate-arn is set in annotation",
+			arn:  aws.String("arn:acm:xxx:yyy:zzz/kkk:www"),
+			// this result list is a fake, as we're not actually going to ACM in this case
+			result: &acm.ListCertificatesOutput{
+				CertificateSummaryList: []*acm.CertificateSummary{
+					{
+						CertificateArn: aws.String("arn:acm:xxx:yyy:zzz/kkk:www"),
+						DomainName:     aws.String("foo.example.com"),
+					},
+				},
+			},
+			expected: 1,
+		}, {
+			name:      "when ACM returns error",
+			ingress:   &extensions.Ingress{},
+			resultErr: fmt.Errorf("oh no!"),
+			expected:  0,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var logger = log.New(test.name)
+			albacm.ACMsvc.(*albacm.Dummy).SetField("ListCertificatesOutput", test.result)
+			albacm.ACMsvc.(*albacm.Dummy).SetField("ListCertificatesError", test.resultErr)
+
+			certificates, err := getCertificates(test.arn, test.ingress, logger)
+			if test.resultErr != err {
+				t.Error(err)
+			}
+
+			if len(certificates) != test.expected {
+				t.Errorf("Expected %d, got %d certificates in result", test.expected, len(certificates))
+			}
+
+			for i, cert := range certificates {
+				want := aws.StringValue(test.result.CertificateSummaryList[i].CertificateArn)
+				have := aws.StringValue(cert.CertificateArn)
+				if want != have {
+					t.Errorf("Certificate ARNs don't match: expected %s, got %s", want, have)
+				}
+			}
+		})
+	}
+}
+
+func Test_uniqueHosts(t *testing.T) {
+	var tests = []struct {
+		expected int
+		input    *extensions.Ingress
+	}{
+		{0, &extensions.Ingress{}},
+		{2, &extensions.Ingress{
+			Spec: extensions.IngressSpec{
+				TLS: []extensions.IngressTLS{
+					{
+						Hosts: []string{"a", "b"},
+					},
+				},
+			},
+		}},
+		{3, &extensions.Ingress{
+			Spec: extensions.IngressSpec{
+				TLS: []extensions.IngressTLS{
+					{
+						Hosts: []string{
+							"a",
+							"b",
+						},
+					},
+				},
+				Rules: []extensions.IngressRule{
+					{
+						Host: "a",
+					}, {
+						Host: "c",
+					},
+				},
+			},
+		}},
+		{1, &extensions.Ingress{
+			Spec: extensions.IngressSpec{
+				Rules: []extensions.IngressRule{
+					{
+						Host: "a",
+					}, {
+						Host: "a",
+					},
+				},
+			},
+		}},
+	}
+
+	for _, test := range tests {
+		if len(uniqueHosts(test.input)) != test.expected {
+			t.Fail()
+		}
+	}
+}
+
+func Test_defaultCertificate(t *testing.T) {
+	t.Run("empty when given empty", func(t *testing.T) {
+		want := 0
+		have := len(defaultCertificate([]*elbv2.Certificate{}))
+		if want != have {
+			t.Errorf("Got %v certificates, wanted %v", have, want)
+		}
+	})
+
+	t.Run("returns first", func(t *testing.T) {
+		want := "first"
+		have := aws.StringValue(defaultCertificate([]*elbv2.Certificate{{
+			CertificateArn: aws.String("first"),
+		}, {
+			CertificateArn: aws.String("second"),
+		}})[0].CertificateArn)
+
+		if want != have {
+			t.Errorf("Got %v certificate, wanted %v", have, want)
+		}
+	})
+}
+
+func Test_otherCertificates(t *testing.T) {
+	t.Run("empty when given empty", func(t *testing.T) {
+		want := 0
+		have := len(otherCertificates([]*elbv2.Certificate{}))
+		if want != have {
+			t.Errorf("Got %v certificates, wanted %v", have, want)
+		}
+	})
+
+	t.Run("returns all but first", func(t *testing.T) {
+		want := "second, third"
+		certs := otherCertificates([]*elbv2.Certificate{{
+			CertificateArn: aws.String("first"),
+		}, {
+			CertificateArn: aws.String("second"),
+		}, {
+			CertificateArn: aws.String("third"),
+		}})
+
+		var arns []string
+		for _, cert := range certs {
+			arns = append(arns, aws.StringValue(cert.CertificateArn))
+		}
+
+		have := strings.Join(arns, ", ")
+		if want != have {
+			t.Errorf("Got %v certificate, wanted %v", have, want)
+		}
+	})
 }

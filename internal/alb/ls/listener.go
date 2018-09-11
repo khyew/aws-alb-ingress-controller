@@ -2,6 +2,9 @@ package ls
 
 import (
 	"fmt"
+	"github.com/aws/aws-sdk-go/service/acm"
+	"github.com/kubernetes-sigs/aws-alb-ingress-controller/internal/aws/albacm"
+	"strings"
 
 	"github.com/kubernetes-sigs/aws-alb-ingress-controller/internal/aws/albrgt"
 	"github.com/kubernetes-sigs/aws-alb-ingress-controller/internal/ingress/annotations/action"
@@ -45,15 +48,17 @@ func NewDesiredListener(o *NewDesiredListenerOptions) (*Listener, error) {
 		},
 	}
 
-	if o.CertificateArn != nil && o.Port.Scheme == elbv2.ProtocolEnumHttps {
-		l.Certificates = []*elbv2.Certificate{
-			{CertificateArn: o.CertificateArn},
-		}
+	if o.Port.Scheme == elbv2.ProtocolEnumHttps {
 		l.Protocol = aws.String(elbv2.ProtocolEnumHttps)
-	}
+		certs, err := getCertificates(o.CertificateArn, o.Ingress, o.Logger)
+		if err != nil {
+			return nil, err
+		}
+		l.Certificates = certs
 
-	if o.SslPolicy != nil && o.Port.Scheme == elbv2.ProtocolEnumHttps {
-		l.SslPolicy = o.SslPolicy
+		if o.SslPolicy != nil {
+			l.SslPolicy = o.SslPolicy
+		}
 	}
 
 	listener := &Listener{
@@ -157,7 +162,9 @@ func (l *Listener) resolveDefaultBackend(rOpts *ReconcileOptions) (*elbv2.Action
 		if err != nil {
 			return nil, err
 		}
-
+		if annos.Action == nil {
+			return nil, nil
+		}
 		return annos.Action.GetAction(l.defaultBackend.ServiceName)
 	}
 
@@ -235,7 +242,7 @@ func (l *Listener) create(rOpts *ReconcileOptions) error {
 	// Attempt listener creation.
 	desired := l.ls.desired
 	in := &elbv2.CreateListenerInput{
-		Certificates:    desired.Certificates,
+		Certificates:    defaultCertificate(desired.Certificates),
 		LoadBalancerArn: desired.LoadBalancerArn,
 		Protocol:        desired.Protocol,
 		Port:            desired.Port,
@@ -248,8 +255,33 @@ func (l *Listener) create(rOpts *ReconcileOptions) error {
 		return fmt.Errorf("Failed Listener creation: %s.", err.Error())
 	}
 
+	for _, cert := range otherCertificates(desired.Certificates) {
+		_, err = albelbv2.ELBV2svc.AddListenerCertificates(&elbv2.AddListenerCertificatesInput{
+			ListenerArn:  o.Listeners[0].ListenerArn,
+			Certificates: []*elbv2.Certificate{cert},
+		})
+		if err != nil {
+			rOpts.Eventf(api.EventTypeWarning, "ERROR", "Error adding certificate %v to listener %v: %s", cert.CertificateArn, *desired.Port, err.Error())
+			l.logger.Infof("Error adding certificate %v to listener %v: %s", cert.CertificateArn, *desired.Port, err.Error())
+		}
+	}
+
 	l.ls.current = o.Listeners[0]
 	return nil
+}
+
+func defaultCertificate(certs []*elbv2.Certificate) []*elbv2.Certificate {
+	if len(certs) <= 1 {
+		return certs
+	}
+	return certs[0:]
+}
+
+func otherCertificates(certs []*elbv2.Certificate) []*elbv2.Certificate {
+	if len(certs) <= 1 {
+		return []*elbv2.Certificate{}
+	}
+	return certs[1:]
 }
 
 // Modifies a listener
@@ -340,4 +372,95 @@ func (l *Listener) DefaultActionArn() *string {
 		return l.ls.current.DefaultActions[0].TargetGroupArn
 	}
 	return nil
+}
+
+func getCertificates(certificateArn *string, ingress *extensions.Ingress, logger *log.Logger) ([]*elbv2.Certificate, error) {
+	if certificateArn != nil {
+		logger.Debugf("New desired listener has certificate-arn '%v' in annotation", certificateArn)
+		return []*elbv2.Certificate{
+			{CertificateArn: certificateArn},
+		}, nil
+	}
+
+	logger.Debugf("New desired listener wants HTTPS, but hasn't provided an certificate-arn annotation")
+
+	var input = &acm.ListCertificatesInput{
+		CertificateStatuses: aws.StringSlice([]string{acm.CertificateStatusIssued}),
+
+		// AWS documentation doesn't specify what the actual default is
+		MaxItems: aws.Int64(500),
+	}
+	var certs []*elbv2.Certificate
+	var seen = map[string]bool{}
+	var page = 0
+	var ingressHosts = uniqueHosts(ingress)
+	err := albacm.ACMsvc.ListCertificatesPages(input, func(output *acm.ListCertificatesOutput, _ bool) bool {
+		logger.Debugf("%d issued certificates in AWS ACM response page %d", len(output.CertificateSummaryList), page)
+		for _, c := range output.CertificateSummaryList {
+			for _, h := range ingressHosts {
+				if domainMatchesHost(aws.StringValue(c.DomainName), h) {
+					logger.Debugf("Domain name '%s', matches TLS host '%v', adding to Listener", aws.StringValue(c.DomainName), h)
+					if !seen[aws.StringValue(c.CertificateArn)] {
+						certs = append(certs, &elbv2.Certificate{CertificateArn: c.CertificateArn})
+						seen[aws.StringValue(c.CertificateArn)] = true
+					}
+				} else {
+					logger.Debugf("Ignoring domain name '%s', doesn't match '%s'", aws.StringValue(c.DomainName), h)
+				}
+			}
+		}
+		page++
+		return true
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return certs, nil
+}
+
+func domainMatchesHost(domainName string, tlsHost string) bool {
+	if strings.HasPrefix(domainName, "*.") {
+		ds := strings.Split(domainName, ".")
+		hs := strings.Split(tlsHost, ".")
+
+		if len(ds) != len(hs) {
+			return false
+		}
+
+		for i, dp := range ds {
+			if i == 0 && dp == "*" {
+				continue
+			}
+			if dp != hs[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	return domainName == tlsHost
+}
+
+func uniqueHosts(ingress *extensions.Ingress) []string {
+	var result []string
+	seen := map[string]bool{}
+
+	for _, r := range ingress.Spec.Rules {
+		if !seen[r.Host] {
+			result = append(result, r.Host)
+			seen[r.Host] = true
+		}
+	}
+	for _, t := range ingress.Spec.TLS {
+		for _, h := range t.Hosts {
+			if !seen[h] {
+				result = append(result, h)
+				seen[h] = true
+			}
+		}
+	}
+
+	return result
 }
