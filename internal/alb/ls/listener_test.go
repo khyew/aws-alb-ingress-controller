@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kubernetes-sigs/aws-alb-ingress-controller/internal/aws/albec2"
+
 	"github.com/kubernetes-sigs/aws-alb-ingress-controller/internal/ingress/controller/dummy"
 
 	"k8s.io/apimachinery/pkg/util/intstr"
